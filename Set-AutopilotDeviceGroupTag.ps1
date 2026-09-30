@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    WinForms GUI to set Windows Autopilot device group tags (delegated Graph auth).
+    WPF GUI to set Windows Autopilot device group tags (delegated Graph auth).
 
 .DESCRIPTION
     Interactive tool for large tenants: connect with Client ID / Tenant ID, load Autopilot
@@ -36,9 +36,12 @@
 
 #Requires -Version 5.1
 
-# StrictMode disabled: WinForms event/scriptblock variable capture is unreliable under StrictMode
+# StrictMode disabled: WPF event/scriptblock variable capture is unreliable under StrictMode
 $ErrorActionPreference = 'Stop'
 
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -73,6 +76,7 @@ $script:GraphPageSize = 200
 
 $script:DeviceCache = New-Object 'System.Collections.Generic.List[AutopilotRow]'
 $script:ViewList = New-Object 'System.Collections.Generic.List[AutopilotRow]'
+$script:ImportedRows = New-Object 'System.Collections.Generic.List[AutopilotRow]'
 $script:Connected = $false
 $script:CancelLoad = $false
 $script:Busy = $false
@@ -84,11 +88,18 @@ $script:SearchText = ''
 
 #region Helpers
 
+function Invoke-UiPump {
+    # Runs pending dispatcher work so the window repaints during long UI-thread loops
+    [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke(
+        [System.Windows.Threading.DispatcherPriority]::Background, [Action]{}
+    )
+}
+
 function Write-UiLog {
     param([string]$Message, [System.Drawing.Color]$Color = [System.Drawing.Color]::Black)
-    if ($null -ne $script:lstLog -and $script:lstLog.InvokeRequired) {
+    if ($null -ne $script:lstLog -and -not $script:lstLog.Dispatcher.CheckAccess()) {
         $script:_uiLogMessage = $Message
-        $script:lstLog.Invoke([Action]{
+        $script:lstLog.Dispatcher.Invoke([Action]{
             Write-UiLog -Message $script:_uiLogMessage
         }) | Out-Null
         return
@@ -130,7 +141,7 @@ function Initialize-GraphModules {
 function Set-AutopilotDeviceGroupTagGraph {
     param(
         [Parameter(Mandatory)][string]$DeviceId,
-        [Parameter(Mandatory)][string]$GroupTag
+        [Parameter(Mandatory)][AllowEmptyString()][string]$GroupTag
     )
     $uri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities/$DeviceId/updateDeviceProperties"
     $body = @{ groupTag = $GroupTag }
@@ -146,30 +157,34 @@ function Set-UiBusy {
     foreach ($c in @(
             $script:txtClientId, $script:txtTenantId, $script:btnConnect, $script:btnDisconnect,
             $script:btnLoadAll, $script:btnCancelLoad, $script:btnSearch, $script:btnClearSearch,
-            $script:btnPrev, $script:btnNext, $script:cmbPageSize, $script:btnApply, $script:btnImportCsv,
+            $script:btnPrev, $script:btnNext, $script:cmbPageSize, $script:btnApply, $script:btnApplyImported, $script:btnRemoveImported, $script:btnImportCsv,
             $script:txtSearch, $script:txtGroupTag, $script:grid
         )) {
         if ($null -eq $c) { continue }
         if ($c -eq $script:btnCancelLoad) {
-            $c.Enabled = $Busy -and $script:CancelLoad -eq $false
+            $c.IsEnabled = $Busy -and $script:CancelLoad -eq $false
             continue
         }
-        if ($c -eq $script:btnConnect) { $c.Enabled = $enabled -and -not $script:Connected; continue }
-        if ($c -eq $script:btnDisconnect) { $c.Enabled = $enabled -and $script:Connected; continue }
+        if ($c -eq $script:btnConnect) { $c.IsEnabled = $enabled -and -not $script:Connected; continue }
+        if ($c -eq $script:btnDisconnect) { $c.IsEnabled = $enabled -and $script:Connected; continue }
+        if ($c -eq $script:btnApplyImported -or $c -eq $script:btnRemoveImported) {
+            $c.IsEnabled = $enabled -and $script:Connected -and $script:ImportedRows.Count -gt 0
+            continue
+        }
         if ($c -in @($script:btnLoadAll, $script:btnSearch, $script:btnClearSearch, $script:btnPrev, $script:btnNext, $script:cmbPageSize, $script:btnApply, $script:btnImportCsv, $script:txtSearch, $script:txtGroupTag, $script:grid)) {
-            $c.Enabled = $enabled -and $script:Connected
+            $c.IsEnabled = $enabled -and $script:Connected
             continue
         }
-        $c.Enabled = $enabled
+        $c.IsEnabled = $enabled
     }
-    $script:btnCancelLoad.Enabled = $Busy
+    $script:btnCancelLoad.IsEnabled = $Busy
 }
 
 function Update-StatusBar {
     param([string]$Text)
-    if ($null -ne $script:lblStatus -and $script:lblStatus.InvokeRequired) {
+    if ($null -ne $script:lblStatus -and -not $script:lblStatus.Dispatcher.CheckAccess()) {
         $script:_uiStatusText = $Text
-        $script:lblStatus.Invoke([Action]{
+        $script:lblStatus.Dispatcher.Invoke([Action]{
             Update-StatusBar -Text $script:_uiStatusText
         }) | Out-Null
         return
@@ -180,21 +195,21 @@ function Update-StatusBar {
 
 function Update-Progress {
     param([int]$Value = 0, [int]$Maximum = 100, [bool]$StyleMarquee = $false)
-    if ($null -ne $script:progress -and $script:progress.InvokeRequired) {
+    if ($null -ne $script:progress -and -not $script:progress.Dispatcher.CheckAccess()) {
         $script:_uiProgressValue = $Value
         $script:_uiProgressMaximum = $Maximum
         $script:_uiProgressMarquee = $StyleMarquee
-        $script:progress.Invoke([Action]{
+        $script:progress.Dispatcher.Invoke([Action]{
             Update-Progress -Value $script:_uiProgressValue -Maximum $script:_uiProgressMaximum -StyleMarquee:$script:_uiProgressMarquee
         }) | Out-Null
         return
     }
     if ($null -eq $script:progress) { return }
     if ($StyleMarquee) {
-        $script:progress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+        $script:progress.IsIndeterminate = $true
     }
     else {
-        $script:progress.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+        $script:progress.IsIndeterminate = $false
         $max = [Math]::Max(1, $Maximum)
         $script:progress.Maximum = $max
         $val = [Math]::Min([Math]::Max(0, $Value), $max)
@@ -327,7 +342,7 @@ function Sync-AllAutopilotDevices {
         $pageNum = $page
         Update-Progress -Value $loadedCount -Maximum ([Math]::Max($loadedCount + $script:GraphPageSize, $loadedCount + 1))
         Update-StatusBar "Loading devices... $loadedCount (page $pageNum)"
-        [System.Windows.Forms.Application]::DoEvents()
+        Invoke-UiPump
         $next = Get-GraphProperty -Object $resp -Name '@odata.nextLink'
         if ($next) { $uri = [string]$next } else { $uri = $null }
     }
@@ -390,8 +405,8 @@ function Get-PageCount {
 }
 
 function Show-CurrentPage {
-    if ($null -ne $script:grid -and $script:grid.InvokeRequired) {
-        $script:grid.Invoke([Action]{ Show-CurrentPage }) | Out-Null
+    if ($null -ne $script:grid -and -not $script:grid.Dispatcher.CheckAccess()) {
+        $script:grid.Dispatcher.Invoke([Action]{ Show-CurrentPage }) | Out-Null
         return
     }
 
@@ -402,33 +417,28 @@ function Show-CurrentPage {
     $start = $script:PageIndex * $script:PageSize
     $take = [Math]::Min($script:PageSize, [Math]::Max(0, $script:ViewList.Count - $start))
 
-    $script:grid.SuspendLayout()
-    $script:grid.DataSource = $null
-    $table = New-Object System.Data.DataTable
-    [void]$table.Columns.Add('Id', [string])
-    [void]$table.Columns.Add('SerialNumber', [string])
-    [void]$table.Columns.Add('GroupTag', [string])
-    [void]$table.Columns.Add('Model', [string])
-    [void]$table.Columns.Add('Manufacturer', [string])
+    $pageList = New-Object 'System.Collections.Generic.List[AutopilotRow]'
     for ($i = 0; $i -lt $take; $i++) {
         $row = $script:ViewList[$start + $i]
         if ($null -eq $row) { continue }
-        [void]$table.Rows.Add($row.Id, $row.SerialNumber, $row.GroupTag, $row.Model, $row.Manufacturer)
+        [void]$pageList.Add($row)
     }
-    $script:grid.DataSource = $table
-    if ($script:grid.Columns['Id']) { $script:grid.Columns['Id'].Visible = $false }
-    foreach ($colName in @('SerialNumber', 'GroupTag', 'Model', 'Manufacturer')) {
-        if ($script:grid.Columns[$colName]) {
-            $script:grid.Columns[$colName].SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Programmatic
+    $script:grid.ItemsSource = $null
+    $script:grid.ItemsSource = $pageList
+
+    $sortDir = if ($script:SortAscending) { [System.ComponentModel.ListSortDirection]::Ascending } else { [System.ComponentModel.ListSortDirection]::Descending }
+    foreach ($col in $script:grid.Columns) {
+        $col.SortDirection = $null
+        if ($col.SortMemberPath -eq $script:SortColumn) {
+            $col.SortDirection = $sortDir
         }
     }
-    $script:grid.ResumeLayout()
 
     $totalCache = $script:DeviceCache.Count
     $filtered = $script:ViewList.Count
     $script:lblPage.Text = "Page $($script:PageIndex + 1) of $pageCount  |  Showing $take  |  Filtered $filtered of $totalCache"
-    $script:btnPrev.Enabled = $script:Connected -and -not $script:Busy -and ($script:PageIndex -gt 0)
-    $script:btnNext.Enabled = $script:Connected -and -not $script:Busy -and ($script:PageIndex -lt $pageCount - 1)
+    $script:btnPrev.IsEnabled = $script:Connected -and -not $script:Busy -and ($script:PageIndex -gt 0)
+    $script:btnNext.IsEnabled = $script:Connected -and -not $script:Busy -and ($script:PageIndex -lt $pageCount - 1)
 }
 
 function Update-DeviceView {
@@ -447,22 +457,119 @@ function Get-SelectedDeviceRows {
     $rows = New-Object 'System.Collections.Generic.List[AutopilotRow]'
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
-    $gridRows = New-Object 'System.Collections.Generic.List[System.Windows.Forms.DataGridViewRow]'
-    foreach ($gridRow in $script:grid.SelectedRows) { [void]$gridRows.Add($gridRow) }
-    foreach ($cell in $script:grid.SelectedCells) { [void]$gridRows.Add($cell.OwningRow) }
-
-    foreach ($gridRow in $gridRows) {
-        if ($null -eq $gridRow -or $gridRow.IsNewRow) { continue }
-        $id = [string]$gridRow.Cells['Id'].Value
+    foreach ($item in $script:grid.SelectedItems) {
+        if ($null -eq $item) { continue }
+        $id = [string]$item.Id
         if ([string]::IsNullOrEmpty($id)) { continue }
         if (-not $seen.Add($id)) { continue }
         $row = New-Object AutopilotRow
         $row.Id = $id
-        $row.SerialNumber = [string]$gridRow.Cells['SerialNumber'].Value
-        $row.GroupTag = [string]$gridRow.Cells['GroupTag'].Value
+        $row.SerialNumber = [string]$item.SerialNumber
+        $row.GroupTag = [string]$item.GroupTag
         [void]$rows.Add($row)
     }
     return $rows
+}
+
+function Update-ImportedButton {
+    if ($null -eq $script:btnApplyImported) { return }
+    $n = if ($null -ne $script:ImportedRows) { $script:ImportedRows.Count } else { 0 }
+    $script:btnApplyImported.Content = "Apply to all imported ($n)"
+    $script:btnApplyImported.IsEnabled = $script:Connected -and -not $script:Busy -and $n -gt 0
+    if ($null -ne $script:btnRemoveImported) {
+        $script:btnRemoveImported.Content = "Remove tag from all imported ($n)"
+        $script:btnRemoveImported.IsEnabled = $script:Connected -and -not $script:Busy -and $n -gt 0
+    }
+}
+
+function Invoke-ApplyGroupTag {
+    param(
+        [System.Collections.Generic.List[AutopilotRow]]$Devices,
+        [AllowEmptyString()][string]$GroupTag
+    )
+    $isRemove = [string]::IsNullOrEmpty($GroupTag)
+    $stamp = (Get-Date).ToString('yyyy-MM-dd_HH-mm')
+    $script:SuccessLogPath = Join-Path $script:ScriptRoot "AutopilotGroupTagSuccess_$stamp.csv"
+    $script:FailedLogPath = Join-Path $script:ScriptRoot "AutopilotGroupTagFailed_$stamp.csv"
+
+    $ok = 0
+    $fail = 0
+    $skipped = 0
+    $cancelled = $false
+    $script:CancelLoad = $false
+    try {
+        Set-UiBusy -Busy $true
+        $script:btnCancelLoad.IsEnabled = $true
+
+        $cacheById = New-Object 'System.Collections.Generic.Dictionary[string,AutopilotRow]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($c in $script:DeviceCache) {
+            if ($null -ne $c -and $c.Id -and -not $cacheById.ContainsKey($c.Id)) { $cacheById[$c.Id] = $c }
+        }
+
+        $i = 0
+        $total = $Devices.Count
+        foreach ($dev in $Devices) {
+            if ($script:CancelLoad) { $cancelled = $true; break }
+            $i++
+            Update-Progress -Value $i -Maximum $total
+            if ($isRemove) {
+                Update-StatusBar "Removing tag ($i / $total): $($dev.SerialNumber)"
+            }
+            else {
+                Update-StatusBar "Applying tag ($i / $total): $($dev.SerialNumber)"
+            }
+            Invoke-UiPump
+            try {
+                $oldTag = if ($null -eq $dev.GroupTag) { '' } else { [string]$dev.GroupTag }
+                if ($oldTag -eq $GroupTag) {
+                    if ($isRemove) {
+                        Write-UiLog "Skip $($dev.SerialNumber) (no group tag)"
+                    }
+                    else {
+                        Write-UiLog "Skip $($dev.SerialNumber) (already '$GroupTag')"
+                    }
+                    $skipped++
+                    continue
+                }
+                Set-AutopilotDeviceGroupTagGraph -DeviceId $dev.Id -GroupTag $GroupTag
+                $cacheRow = $null
+                if ($cacheById.TryGetValue($dev.Id, [ref]$cacheRow) -and $null -ne $cacheRow) {
+                    $cacheRow.GroupTag = $GroupTag
+                }
+                $dev.GroupTag = $GroupTag
+                if ($isRemove) {
+                    Write-AutopilotLog -Status Success -SerialNumber $dev.SerialNumber -GroupTag $GroupTag -Message "Group tag removed (was '$oldTag')"
+                    Write-UiLog "REMOVED $($dev.SerialNumber) (was '$oldTag')"
+                }
+                else {
+                    Write-AutopilotLog -Status Success -SerialNumber $dev.SerialNumber -GroupTag $GroupTag -Message 'Group tag updated'
+                    Write-UiLog "OK $($dev.SerialNumber) -> $GroupTag"
+                }
+                $ok++
+            }
+            catch {
+                $fail++
+                Write-AutopilotLog -Status Failed -SerialNumber $dev.SerialNumber -GroupTag $GroupTag -Message "$_"
+                Write-UiLog "FAIL $($dev.SerialNumber): $_"
+            }
+        }
+        Show-CurrentPage
+        $donePrefix = if ($isRemove) { 'Remove done.' } else { 'Apply done.' }
+        Update-StatusBar "$donePrefix Success: $ok  Skipped: $skipped  Failed: $fail$(if ($cancelled) { ' (cancelled)' })"
+        Write-UiLog "Logs: $($script:SuccessLogPath) / $($script:FailedLogPath)"
+    }
+    finally {
+        $script:CancelLoad = $false
+        Set-UiBusy -Busy $false
+        Update-ImportedButton
+    }
+    return [PSCustomObject]@{
+        Ok        = $ok
+        Fail      = $fail
+        Skipped   = $skipped
+        Cancelled = $cancelled
+        Stamp     = $stamp
+    }
 }
 
 function Start-BackgroundWork {
@@ -480,12 +587,11 @@ function Start-BackgroundWork {
     [void]$ps.AddScript($Work.ToString())
     $handle = $ps.BeginInvoke()
 
-    $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = 200
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(200)
     $timer.Add_Tick({
         if (-not $handle.IsCompleted) { return }
         $timer.Stop()
-        $timer.Dispose()
         try {
             $result = $ps.EndInvoke($handle)
             if ($ps.HadErrors) {
@@ -514,211 +620,344 @@ function Start-BackgroundWork {
 
 #region UI
 
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'Autopilot Group Tag'
-$form.Size = New-Object System.Drawing.Size(1100, 760)
-$form.StartPosition = 'CenterScreen'
-$form.MinimumSize = New-Object System.Drawing.Size(960, 640)
+[xml]$xaml = @'
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Autopilot Group Tag"
+    Height="800" Width="1200"
+    MinHeight="640" MinWidth="960"
+    WindowStartupLocation="CenterScreen"
+    Background="#F5F6FA">
 
-# Connection panel (taller; full-width ID fields so GUIDs are not clipped)
-$grpConn = New-Object System.Windows.Forms.GroupBox
-$grpConn.Text = 'Connection (delegated)'
-$grpConn.Location = New-Object System.Drawing.Point(12, 8)
-$grpConn.Size = New-Object System.Drawing.Size(1060, 118)
-$grpConn.Anchor = 'Top,Left,Right'
-$form.Controls.Add($grpConn)
+    <Window.Resources>
+        <!-- Accent color -->
+        <SolidColorBrush x:Key="AccentBrush" Color="#0078D4"/>
+        <SolidColorBrush x:Key="AccentHoverBrush" Color="#106EBE"/>
+        <SolidColorBrush x:Key="BorderBrush" Color="#D1D5DB"/>
+        <SolidColorBrush x:Key="CardBrush" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="TextSecondary" Color="#6B7280"/>
 
-$lblClient = New-Object System.Windows.Forms.Label
-$lblClient.Text = 'Client ID'
-$lblClient.Location = New-Object System.Drawing.Point(12, 28)
-$lblClient.Size = New-Object System.Drawing.Size(70, 20)
-$grpConn.Controls.Add($lblClient)
+        <!-- Button style -->
+        <Style x:Key="PrimaryButton" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding" Value="16,8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="{StaticResource AccentHoverBrush}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.5"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
 
-$script:txtClientId = New-Object System.Windows.Forms.TextBox
-$script:txtClientId.Location = New-Object System.Drawing.Point(90, 24)
-$script:txtClientId.Size = New-Object System.Drawing.Size(720, 24)
-$script:txtClientId.Anchor = 'Top,Left,Right'
-$script:txtClientId.Font = New-Object System.Drawing.Font('Consolas', 9)
-$grpConn.Controls.Add($script:txtClientId)
+        <Style x:Key="DangerButton" TargetType="Button">
+            <Setter Property="Background" Value="#C42B1C"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding" Value="16,8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#A4262C"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.5"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
 
-$script:btnConnect = New-Object System.Windows.Forms.Button
-$script:btnConnect.Text = 'Connect'
-$script:btnConnect.Location = New-Object System.Drawing.Point(830, 22)
-$script:btnConnect.Size = New-Object System.Drawing.Size(100, 28)
-$script:btnConnect.Anchor = 'Top,Right'
-$grpConn.Controls.Add($script:btnConnect)
+        <Style x:Key="SecondaryButton" TargetType="Button">
+            <Setter Property="Background" Value="#E5E7EB"/>
+            <Setter Property="Foreground" Value="#374151"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="16,8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#D1D5DB"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.5"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
 
-$script:btnDisconnect = New-Object System.Windows.Forms.Button
-$script:btnDisconnect.Text = 'Disconnect'
-$script:btnDisconnect.Location = New-Object System.Drawing.Point(940, 22)
-$script:btnDisconnect.Size = New-Object System.Drawing.Size(100, 28)
-$script:btnDisconnect.Anchor = 'Top,Right'
-$script:btnDisconnect.Enabled = $false
-$grpConn.Controls.Add($script:btnDisconnect)
+        <!-- TextBox style -->
+        <Style TargetType="TextBox">
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+        </Style>
 
-$lblTenant = New-Object System.Windows.Forms.Label
-$lblTenant.Text = 'Tenant ID'
-$lblTenant.Location = New-Object System.Drawing.Point(12, 68)
-$lblTenant.Size = New-Object System.Drawing.Size(70, 20)
-$grpConn.Controls.Add($lblTenant)
+        <!-- ComboBox style -->
+        <Style TargetType="ComboBox">
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
+        </Style>
 
-$script:txtTenantId = New-Object System.Windows.Forms.TextBox
-$script:txtTenantId.Location = New-Object System.Drawing.Point(90, 64)
-$script:txtTenantId.Size = New-Object System.Drawing.Size(950, 24)
-$script:txtTenantId.Anchor = 'Top,Left,Right'
-$script:txtTenantId.Font = New-Object System.Drawing.Font('Consolas', 9)
-$grpConn.Controls.Add($script:txtTenantId)
+        <!-- Label style -->
+        <Style TargetType="Label">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Foreground" Value="#374151"/>
+            <Setter Property="Padding" Value="0,0,0,4"/>
+            <Setter Property="FontWeight" Value="Medium"/>
+        </Style>
 
-# Toolbar
-$pnlTools = New-Object System.Windows.Forms.Panel
-$pnlTools.Location = New-Object System.Drawing.Point(12, 136)
-$pnlTools.Size = New-Object System.Drawing.Size(1060, 70)
-$pnlTools.Anchor = 'Top,Left,Right'
-$form.Controls.Add($pnlTools)
+        <!-- ListBox style -->
+        <Style TargetType="ListBox">
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontFamily" Value="Consolas"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Foreground" Value="#374151"/>
+        </Style>
+    </Window.Resources>
 
-$script:btnLoadAll = New-Object System.Windows.Forms.Button
-$script:btnLoadAll.Text = 'Load all devices'
-$script:btnLoadAll.Location = New-Object System.Drawing.Point(0, 4)
-$script:btnLoadAll.Width = 130
-$script:btnLoadAll.Enabled = $false
-$pnlTools.Controls.Add($script:btnLoadAll)
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
 
-$script:btnCancelLoad = New-Object System.Windows.Forms.Button
-$script:btnCancelLoad.Text = 'Cancel'
-$script:btnCancelLoad.Location = New-Object System.Drawing.Point(140, 4)
-$script:btnCancelLoad.Width = 80
-$script:btnCancelLoad.Enabled = $false
-$pnlTools.Controls.Add($script:btnCancelLoad)
+        <!-- Header -->
+        <TextBlock Grid.Row="0" Text="Autopilot Group Tag"
+                   FontSize="22" FontWeight="Bold" Foreground="#1F2937"
+                   Margin="0,0,0,12"/>
 
-$lblSearch = New-Object System.Windows.Forms.Label
-$lblSearch.Text = 'Serial'
-$lblSearch.Location = New-Object System.Drawing.Point(240, 8)
-$lblSearch.AutoSize = $true
-$pnlTools.Controls.Add($lblSearch)
+        <!-- Connection card -->
+        <Border Grid.Row="1" Background="{StaticResource CardBrush}"
+                CornerRadius="6" Padding="16,12"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                Margin="0,0,0,10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Label Grid.Row="0" Grid.Column="0" Content="Client ID:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <TextBox Grid.Row="0" Grid.Column="1" Name="txtClientId" FontFamily="Consolas" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <Button Grid.Row="0" Grid.Column="2" Name="btnConnect" Content="Connect" Style="{StaticResource PrimaryButton}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <Button Grid.Row="0" Grid.Column="3" Name="btnDisconnect" Content="Disconnect" Style="{StaticResource SecondaryButton}" IsEnabled="False" VerticalAlignment="Center"/>
+                <Label Grid.Row="1" Grid.Column="0" Content="Tenant ID:" VerticalAlignment="Center" Margin="0,8,8,0"/>
+                <TextBox Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="3" Name="txtTenantId" FontFamily="Consolas" VerticalAlignment="Center" Margin="0,8,0,0"/>
+            </Grid>
+        </Border>
 
-$script:txtSearch = New-Object System.Windows.Forms.TextBox
-$script:txtSearch.Location = New-Object System.Drawing.Point(285, 4)
-$script:txtSearch.Width = 180
-$script:txtSearch.Enabled = $false
-$pnlTools.Controls.Add($script:txtSearch)
+        <!-- Actions card -->
+        <Border Grid.Row="2" Background="{StaticResource CardBrush}"
+                CornerRadius="6" Padding="16,12"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                Margin="0,0,0,10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <StackPanel Grid.Row="0" Orientation="Horizontal">
+                    <Button Name="btnLoadAll" Content="Load all devices" Style="{StaticResource PrimaryButton}" IsEnabled="False"/>
+                    <Button Name="btnCancelLoad" Content="Cancel" Style="{StaticResource SecondaryButton}" IsEnabled="False" Margin="8,0,0,0"/>
+                    <Label Content="Serial:" VerticalAlignment="Center" Margin="16,0,8,0"/>
+                    <TextBox Name="txtSearch" Width="200" IsEnabled="False" VerticalAlignment="Center"/>
+                    <Button Name="btnSearch" Content="Search" Style="{StaticResource PrimaryButton}" IsEnabled="False" Margin="8,0,0,0"/>
+                    <Button Name="btnClearSearch" Content="Clear" Style="{StaticResource SecondaryButton}" IsEnabled="False" Margin="8,0,0,0"/>
+                    <Button Name="btnImportCsv" Content="Import CSV..." Style="{StaticResource SecondaryButton}" IsEnabled="False" Margin="8,0,0,0"/>
+                </StackPanel>
+                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,10,0,0">
+                    <Label Content="Group tag:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBox Name="txtGroupTag" Width="200" IsEnabled="False" VerticalAlignment="Center"/>
+                    <Button Name="btnApply" Content="Apply to selected" Style="{StaticResource PrimaryButton}" IsEnabled="False" Margin="8,0,0,0"/>
+                    <Button Name="btnApplyImported" Content="Apply to all imported (0)" Style="{StaticResource PrimaryButton}" IsEnabled="False" Margin="8,0,0,0" ToolTip="Apply the group tag to every device found in the last CSV import (all pages)"/>
+                    <Button Name="btnRemoveImported" Content="Remove tag from all imported (0)" Style="{StaticResource DangerButton}" IsEnabled="False" Margin="8,0,0,0" ToolTip="Clear the group tag on every device found in the last CSV import (all pages)"/>
+                    <Label Content="Page size:" VerticalAlignment="Center" Margin="16,0,8,0"/>
+                    <ComboBox Name="cmbPageSize" Width="80" IsEnabled="False" VerticalAlignment="Center"/>
+                    <Button Name="btnPrev" Content="&lt;" Style="{StaticResource SecondaryButton}" IsEnabled="False" Width="36" Margin="8,0,0,0"/>
+                    <Button Name="btnNext" Content="&gt;" Style="{StaticResource SecondaryButton}" IsEnabled="False" Width="36" Margin="8,0,0,0"/>
+                    <TextBlock Name="lblPage" Text="Page 0 of 0" VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}" FontSize="12" Margin="12,0,0,0"/>
+                </StackPanel>
+            </Grid>
+        </Border>
 
-$script:btnSearch = New-Object System.Windows.Forms.Button
-$script:btnSearch.Text = 'Search'
-$script:btnSearch.Location = New-Object System.Drawing.Point(475, 4)
-$script:btnSearch.Width = 80
-$script:btnSearch.Enabled = $false
-$pnlTools.Controls.Add($script:btnSearch)
+        <!-- DataGrid card -->
+        <Border Grid.Row="3" Background="{StaticResource CardBrush}"
+                CornerRadius="6"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="1">
+            <DataGrid Name="grid"
+                      AutoGenerateColumns="False"
+                      IsReadOnly="True"
+                      CanUserSortColumns="True"
+                      CanUserReorderColumns="True"
+                      CanUserResizeColumns="True"
+                      SelectionMode="Extended"
+                      SelectionUnit="FullRow"
+                      EnableRowVirtualization="True"
+                      IsEnabled="False"
+                      GridLinesVisibility="Horizontal"
+                      HorizontalGridLinesBrush="#F3F4F6"
+                      HeadersVisibility="Column"
+                      AlternatingRowBackground="#F9FAFB"
+                      RowBackground="White"
+                      BorderThickness="0"
+                      FontSize="12.5"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Auto">
+                <DataGrid.ColumnHeaderStyle>
+                    <Style TargetType="DataGridColumnHeader">
+                        <Setter Property="Background" Value="#F3F4F6"/>
+                        <Setter Property="Foreground" Value="#374151"/>
+                        <Setter Property="FontWeight" Value="SemiBold"/>
+                        <Setter Property="FontSize" Value="12"/>
+                        <Setter Property="Padding" Value="10,8"/>
+                        <Setter Property="BorderBrush" Value="#E5E7EB"/>
+                        <Setter Property="BorderThickness" Value="0,0,1,1"/>
+                        <Setter Property="Cursor" Value="Hand"/>
+                    </Style>
+                </DataGrid.ColumnHeaderStyle>
+                <DataGrid.CellStyle>
+                    <Style TargetType="DataGridCell">
+                        <Setter Property="Padding" Value="10,6"/>
+                        <Setter Property="BorderThickness" Value="0"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="DataGridCell">
+                                    <Border Padding="{TemplateBinding Padding}" Background="{TemplateBinding Background}">
+                                        <ContentPresenter VerticalAlignment="Center"/>
+                                    </Border>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                        <Style.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="Background" Value="#DBEAFE"/>
+                                <Setter Property="Foreground" Value="#1F2937"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </DataGrid.CellStyle>
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Serial Number" Binding="{Binding SerialNumber}" SortMemberPath="SerialNumber" Width="*"/>
+                    <DataGridTextColumn Header="Group Tag" Binding="{Binding GroupTag}" SortMemberPath="GroupTag" Width="*"/>
+                    <DataGridTextColumn Header="Model" Binding="{Binding Model}" SortMemberPath="Model" Width="*"/>
+                    <DataGridTextColumn Header="Manufacturer" Binding="{Binding Manufacturer}" SortMemberPath="Manufacturer" Width="*"/>
+                </DataGrid.Columns>
+            </DataGrid>
+        </Border>
 
-$script:btnClearSearch = New-Object System.Windows.Forms.Button
-$script:btnClearSearch.Text = 'Clear'
-$script:btnClearSearch.Location = New-Object System.Drawing.Point(560, 4)
-$script:btnClearSearch.Width = 70
-$script:btnClearSearch.Enabled = $false
-$pnlTools.Controls.Add($script:btnClearSearch)
+        <!-- Log card -->
+        <Border Grid.Row="4" Background="{StaticResource CardBrush}"
+                CornerRadius="6" Padding="12,8"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                Margin="0,8,0,0">
+            <StackPanel>
+                <Label Content="Log" Padding="0,0,0,4"/>
+                <ListBox Name="lstLog" Height="110"/>
+            </StackPanel>
+        </Border>
 
-$script:btnImportCsv = New-Object System.Windows.Forms.Button
-$script:btnImportCsv.Text = 'Import CSV...'
-$script:btnImportCsv.Location = New-Object System.Drawing.Point(650, 4)
-$script:btnImportCsv.Width = 110
-$script:btnImportCsv.Enabled = $false
-$pnlTools.Controls.Add($script:btnImportCsv)
+        <!-- Status bar -->
+        <Border Grid.Row="5" Background="{StaticResource CardBrush}"
+                CornerRadius="4" Padding="12,8"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                Margin="0,8,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Name="lblStatus" Text="Enter Client ID and Tenant ID, then Connect."
+                           VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}" FontSize="12"
+                           TextTrimming="CharacterEllipsis"/>
+                <ProgressBar Grid.Column="1" Name="progress" Width="220" Height="8"
+                             Minimum="0" Maximum="100" Value="0"
+                             VerticalAlignment="Center" Margin="12,0,0,0"
+                             Foreground="{StaticResource AccentBrush}" Background="#E5E7EB" BorderThickness="0"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
+'@
 
-$lblTag = New-Object System.Windows.Forms.Label
-$lblTag.Text = 'Group tag'
-$lblTag.Location = New-Object System.Drawing.Point(0, 40)
-$lblTag.AutoSize = $true
-$pnlTools.Controls.Add($lblTag)
+$reader = (New-Object System.Xml.XmlNodeReader $xaml)
+$window = [Windows.Markup.XamlReader]::Load($reader)
 
-$script:txtGroupTag = New-Object System.Windows.Forms.TextBox
-$script:txtGroupTag.Location = New-Object System.Drawing.Point(70, 36)
-$script:txtGroupTag.Width = 200
-$script:txtGroupTag.Enabled = $false
-$pnlTools.Controls.Add($script:txtGroupTag)
+$script:txtClientId    = $window.FindName('txtClientId')
+$script:txtTenantId    = $window.FindName('txtTenantId')
+$script:btnConnect     = $window.FindName('btnConnect')
+$script:btnDisconnect  = $window.FindName('btnDisconnect')
+$script:btnLoadAll     = $window.FindName('btnLoadAll')
+$script:btnCancelLoad  = $window.FindName('btnCancelLoad')
+$script:txtSearch      = $window.FindName('txtSearch')
+$script:btnSearch      = $window.FindName('btnSearch')
+$script:btnClearSearch = $window.FindName('btnClearSearch')
+$script:btnImportCsv   = $window.FindName('btnImportCsv')
+$script:txtGroupTag    = $window.FindName('txtGroupTag')
+$script:btnApply       = $window.FindName('btnApply')
+$script:btnApplyImported = $window.FindName('btnApplyImported')
+$script:btnRemoveImported = $window.FindName('btnRemoveImported')
+$script:cmbPageSize    = $window.FindName('cmbPageSize')
+$script:btnPrev        = $window.FindName('btnPrev')
+$script:btnNext        = $window.FindName('btnNext')
+$script:lblPage        = $window.FindName('lblPage')
+$script:grid           = $window.FindName('grid')
+$script:lstLog         = $window.FindName('lstLog')
+$script:progress       = $window.FindName('progress')
+$script:lblStatus      = $window.FindName('lblStatus')
 
-$script:btnApply = New-Object System.Windows.Forms.Button
-$script:btnApply.Text = 'Apply to selected'
-$script:btnApply.Location = New-Object System.Drawing.Point(280, 34)
-$script:btnApply.Width = 130
-$script:btnApply.Enabled = $false
-$pnlTools.Controls.Add($script:btnApply)
-
-$lblPageSize = New-Object System.Windows.Forms.Label
-$lblPageSize.Text = 'Page size'
-$lblPageSize.Location = New-Object System.Drawing.Point(430, 40)
-$lblPageSize.AutoSize = $true
-$pnlTools.Controls.Add($lblPageSize)
-
-$script:cmbPageSize = New-Object System.Windows.Forms.ComboBox
-$script:cmbPageSize.DropDownStyle = 'DropDownList'
-$script:cmbPageSize.Location = New-Object System.Drawing.Point(500, 36)
-$script:cmbPageSize.Width = 70
 @('50', '100', '200', '300', '400', '500') | ForEach-Object { [void]$script:cmbPageSize.Items.Add($_) }
 $script:cmbPageSize.SelectedItem = '100'
-$script:cmbPageSize.Enabled = $false
-$pnlTools.Controls.Add($script:cmbPageSize)
-
-$script:btnPrev = New-Object System.Windows.Forms.Button
-$script:btnPrev.Text = '<'
-$script:btnPrev.Location = New-Object System.Drawing.Point(590, 34)
-$script:btnPrev.Width = 40
-$script:btnPrev.Enabled = $false
-$pnlTools.Controls.Add($script:btnPrev)
-
-$script:btnNext = New-Object System.Windows.Forms.Button
-$script:btnNext.Text = '>'
-$script:btnNext.Location = New-Object System.Drawing.Point(635, 34)
-$script:btnNext.Width = 40
-$script:btnNext.Enabled = $false
-$pnlTools.Controls.Add($script:btnNext)
-
-$script:lblPage = New-Object System.Windows.Forms.Label
-$script:lblPage.Text = 'Page 0 of 0'
-$script:lblPage.Location = New-Object System.Drawing.Point(685, 40)
-$script:lblPage.AutoSize = $true
-$pnlTools.Controls.Add($script:lblPage)
-
-# Grid
-$script:grid = New-Object System.Windows.Forms.DataGridView
-$script:grid.Location = New-Object System.Drawing.Point(12, 214)
-$script:grid.Size = New-Object System.Drawing.Size(1060, 316)
-$script:grid.Anchor = 'Top,Bottom,Left,Right'
-$script:grid.ReadOnly = $true
-$script:grid.AllowUserToAddRows = $false
-$script:grid.AllowUserToDeleteRows = $false
-$script:grid.SelectionMode = 'FullRowSelect'
-$script:grid.MultiSelect = $true
-$script:grid.AutoSizeColumnsMode = 'Fill'
-$script:grid.RowHeadersVisible = $false
-$script:grid.Enabled = $false
-$form.Controls.Add($script:grid)
-
-# Log
-$lblLog = New-Object System.Windows.Forms.Label
-$lblLog.Text = 'Log'
-$lblLog.Location = New-Object System.Drawing.Point(12, 538)
-$lblLog.Anchor = 'Bottom,Left'
-$lblLog.AutoSize = $true
-$form.Controls.Add($lblLog)
-
-$script:lstLog = New-Object System.Windows.Forms.ListBox
-$script:lstLog.Location = New-Object System.Drawing.Point(12, 558)
-$script:lstLog.Size = New-Object System.Drawing.Size(1060, 80)
-$script:lstLog.Anchor = 'Bottom,Left,Right'
-$form.Controls.Add($script:lstLog)
-
-# Status / progress
-$script:progress = New-Object System.Windows.Forms.ProgressBar
-$script:progress.Location = New-Object System.Drawing.Point(12, 648)
-$script:progress.Size = New-Object System.Drawing.Size(1060, 18)
-$script:progress.Anchor = 'Bottom,Left,Right'
-$form.Controls.Add($script:progress)
-
-$script:lblStatus = New-Object System.Windows.Forms.Label
-$script:lblStatus.Text = 'Enter Client ID and Tenant ID, then Connect.'
-$script:lblStatus.Location = New-Object System.Drawing.Point(12, 670)
-$script:lblStatus.AutoSize = $true
-$script:lblStatus.Anchor = 'Bottom,Left'
-$form.Controls.Add($script:lblStatus)
 
 #endregion
 
@@ -825,11 +1064,12 @@ Original error: $errText
     }
     finally {
         Set-UiBusy -Busy $false
-        $script:btnConnect.Enabled = -not $script:Connected
-        $script:btnDisconnect.Enabled = $script:Connected
+        $script:btnConnect.IsEnabled = -not $script:Connected
+        $script:btnDisconnect.IsEnabled = $script:Connected
         foreach ($c in @($script:btnLoadAll, $script:btnSearch, $script:btnClearSearch, $script:btnImportCsv, $script:btnApply, $script:txtSearch, $script:txtGroupTag, $script:cmbPageSize, $script:grid)) {
-            $c.Enabled = $script:Connected
+            $c.IsEnabled = $script:Connected
         }
+        Update-ImportedButton
     }
 })
 
@@ -841,14 +1081,16 @@ $script:btnDisconnect.Add_Click({
     $script:Connected = $false
     $script:DeviceCache.Clear()
     $script:ViewList.Clear()
+    $script:ImportedRows.Clear()
     Show-CurrentPage
     Write-UiLog 'Disconnected.'
     Update-StatusBar 'Disconnected. Enter Client ID / Tenant ID and Connect.'
-    $script:btnConnect.Enabled = $true
-    $script:btnDisconnect.Enabled = $false
+    $script:btnConnect.IsEnabled = $true
+    $script:btnDisconnect.IsEnabled = $false
     foreach ($c in @($script:btnLoadAll, $script:btnSearch, $script:btnClearSearch, $script:btnImportCsv, $script:btnApply, $script:txtSearch, $script:txtGroupTag, $script:cmbPageSize, $script:grid, $script:btnPrev, $script:btnNext)) {
-        $c.Enabled = $false
+        $c.IsEnabled = $false
     }
+    Update-ImportedButton
 })
 
 $script:btnCancelLoad.Add_Click({
@@ -860,7 +1102,7 @@ $script:btnLoadAll.Add_Click({
     if (-not $script:Connected) { return }
     $script:CancelLoad = $false
     Set-UiBusy -Busy $true
-    $script:btnCancelLoad.Enabled = $true
+    $script:btnCancelLoad.IsEnabled = $true
     Update-Progress -Value 0 -Maximum 100 -StyleMarquee $true
     Update-StatusBar 'Loading all Autopilot devices from Graph...'
     Write-UiLog 'Starting full device load...'
@@ -898,9 +1140,9 @@ $script:btnLoadAll.Add_Click({
     finally {
         $script:CancelLoad = $false
         Set-UiBusy -Busy $false
-        $script:btnCancelLoad.Enabled = $false
-        $script:btnConnect.Enabled = -not $script:Connected
-        $script:btnDisconnect.Enabled = $script:Connected
+        $script:btnCancelLoad.IsEnabled = $false
+        $script:btnConnect.IsEnabled = -not $script:Connected
+        $script:btnDisconnect.IsEnabled = $script:Connected
     }
 })
 
@@ -955,8 +1197,8 @@ function Invoke-SerialSearch {
 $script:btnSearch.Add_Click({ Invoke-SerialSearch })
 $script:txtSearch.Add_KeyDown({
     param($eventSender, $e)
-    if ($e.KeyCode -eq 'Enter') {
-        $e.SuppressKeyPress = $true
+    if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+        $e.Handled = $true
         Invoke-SerialSearch
     }
 })
@@ -974,8 +1216,9 @@ $script:btnClearSearch.Add_Click({
     Write-UiLog 'Search cleared.'
 })
 
-$script:cmbPageSize.Add_SelectedIndexChanged({
+$script:cmbPageSize.Add_SelectionChanged({
     if ($script:Busy) { return }
+    if ($null -eq $script:cmbPageSize.SelectedItem) { return }
     $script:PageSize = [int]$script:cmbPageSize.SelectedItem
     $script:PageIndex = 0
     Show-CurrentPage
@@ -995,17 +1238,18 @@ $script:btnNext.Add_Click({
     }
 })
 
-$script:grid.Add_ColumnHeaderMouseClick({
-    param($eventSender, $e)
+$script:grid.Add_Sorting({
+    param($s, $e)
+    $e.Handled = $true
     if (-not $script:Connected -or $script:Busy) { return }
     if ($script:DeviceCache.Count -eq 0) { return }
-    $col = $script:grid.Columns[$e.ColumnIndex]
-    if (-not $col -or $col.Name -eq 'Id') { return }
-    if ($script:SortColumn -eq $col.Name) {
+    $colName = [string]$e.Column.SortMemberPath
+    if ([string]::IsNullOrEmpty($colName)) { return }
+    if ($script:SortColumn -eq $colName) {
         $script:SortAscending = -not $script:SortAscending
     }
     else {
-        $script:SortColumn = $col.Name
+        $script:SortColumn = $colName
         $script:SortAscending = $true
     }
     Write-UiLog "Sort by $($script:SortColumn) $(if ($script:SortAscending) { 'asc' } else { 'desc' }) (all filtered rows)"
@@ -1032,44 +1276,55 @@ $script:btnApply.Add_Click({
     )
     if ($confirm -ne 'Yes') { return }
 
-    try {
-        Set-UiBusy -Busy $true
-        $ok = 0
-        $fail = 0
-        $i = 0
-        $total = $selected.Count
-        foreach ($dev in $selected) {
-            $i++
-            Update-Progress -Value $i -Maximum $total
-            Update-StatusBar "Applying tag ($i / $total): $($dev.SerialNumber)"
-            try {
-                if ($dev.GroupTag -eq $tag) {
-                    Write-UiLog "Skip $($dev.SerialNumber) (already '$tag')"
-                    $ok++
-                    continue
-                }
-                Set-AutopilotDeviceGroupTagGraph -DeviceId $dev.Id -GroupTag $tag
-                # update cache
-                foreach ($c in $script:DeviceCache) {
-                    if ($c.Id -eq $dev.Id) { $c.GroupTag = $tag; break }
-                }
-                Write-AutopilotLog -Status Success -SerialNumber $dev.SerialNumber -GroupTag $tag -Message 'Group tag updated'
-                Write-UiLog "OK $($dev.SerialNumber) -> $tag"
-                $ok++
-            }
-            catch {
-                $fail++
-                Write-AutopilotLog -Status Failed -SerialNumber $dev.SerialNumber -GroupTag $tag -Message "$_"
-                Write-UiLog "FAIL $($dev.SerialNumber): $_"
-            }
-        }
-        Update-DeviceView
-        Update-StatusBar "Apply done. Success: $ok  Failed: $fail"
-        [System.Windows.Forms.MessageBox]::Show("Done.`nSuccess: $ok`nFailed: $fail", 'Apply', 'OK', 'Information') | Out-Null
+    $devices = New-Object 'System.Collections.Generic.List[AutopilotRow]'
+    foreach ($d in $selected) { if ($null -ne $d) { [void]$devices.Add($d) } }
+    $r = Invoke-ApplyGroupTag -Devices $devices -GroupTag $tag
+    [System.Windows.Forms.MessageBox]::Show("Done.`nSuccess: $($r.Ok)`nSkipped: $($r.Skipped)`nFailed: $($r.Fail)$(if ($r.Cancelled) { "`n(cancelled)" })`nLog folder: $script:ScriptRoot`nFiles: AutopilotGroupTag*_$($r.Stamp).csv", 'Apply', 'OK', 'Information') | Out-Null
+})
+
+$script:btnApplyImported.Add_Click({
+    if (-not $script:Connected) { return }
+    $tag = $script:txtGroupTag.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($tag)) {
+        [System.Windows.Forms.MessageBox]::Show('Enter a Group tag.', 'Apply', 'OK', 'Warning') | Out-Null
+        return
     }
-    finally {
-        Set-UiBusy -Busy $false
+    if ($null -eq $script:ImportedRows -or $script:ImportedRows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('Import a CSV first.', 'Apply', 'OK', 'Warning') | Out-Null
+        return
     }
+    $n = $script:ImportedRows.Count
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "Set group tag '$tag' on ALL $n device(s) from the last CSV import?`n`nThis includes devices on every page, not only the visible one.",
+        'Confirm',
+        'YesNo',
+        'Warning'
+    )
+    if ($confirm -ne 'Yes') { return }
+    $devices = New-Object 'System.Collections.Generic.List[AutopilotRow]'
+    foreach ($d in $script:ImportedRows) { if ($null -ne $d) { [void]$devices.Add($d) } }
+    $r = Invoke-ApplyGroupTag -Devices $devices -GroupTag $tag
+    [System.Windows.Forms.MessageBox]::Show("Done.`nSuccess: $($r.Ok)`nSkipped: $($r.Skipped)`nFailed: $($r.Fail)$(if ($r.Cancelled) { "`n(cancelled)" })`nLog folder: $script:ScriptRoot`nFiles: AutopilotGroupTag*_$($r.Stamp).csv", 'Apply', 'OK', 'Information') | Out-Null
+})
+
+$script:btnRemoveImported.Add_Click({
+    if (-not $script:Connected) { return }
+    if ($null -eq $script:ImportedRows -or $script:ImportedRows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('Import a CSV first.', 'Apply', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $n = $script:ImportedRows.Count
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "Remove the group tag from ALL $n device(s) from the last CSV import?`n`nThis includes devices on every page, not only the visible one. Devices without a tag are skipped.",
+        'Confirm',
+        'YesNo',
+        'Warning'
+    )
+    if ($confirm -ne 'Yes') { return }
+    $devices = New-Object 'System.Collections.Generic.List[AutopilotRow]'
+    foreach ($d in $script:ImportedRows) { if ($null -ne $d) { [void]$devices.Add($d) } }
+    $r = Invoke-ApplyGroupTag -Devices $devices -GroupTag ''
+    [System.Windows.Forms.MessageBox]::Show("Done.`nRemoved: $($r.Ok)`nSkipped: $($r.Skipped)`nFailed: $($r.Fail)$(if ($r.Cancelled) { "`n(cancelled)" })`nLog folder: $script:ScriptRoot`nFiles: AutopilotGroupTag*_$($r.Stamp).csv", 'Remove group tag', 'OK', 'Information') | Out-Null
 })
 
 $script:btnImportCsv.Add_Click({
@@ -1111,6 +1366,7 @@ $script:btnImportCsv.Add_Click({
             $i++
             Update-Progress -Value $i -Maximum $serials.Count
             Update-StatusBar "Resolving CSV serials ($i / $($serials.Count))"
+            Invoke-UiPump
             $key = $sn.ToLowerInvariant()
             if ($cacheMap.ContainsKey($key)) {
                 $found.Add($cacheMap[$key]) | Out-Null
@@ -1140,7 +1396,8 @@ $script:btnImportCsv.Add_Click({
         $script:txtSearch.Text = ''
         $script:PageIndex = 0
         Show-CurrentPage
-        $script:grid.SelectAll()
+        $script:ImportedRows = $found
+        Update-ImportedButton
 
         $msg = "Found: $($found.Count)`nNot found: $($missing.Count)"
         if ($missing.Count -gt 0 -and $missing.Count -le 20) {
@@ -1149,9 +1406,21 @@ $script:btnImportCsv.Add_Click({
         elseif ($missing.Count -gt 20) {
             $msg += "`n`n(First 20 missing)`n$(($missing | Select-Object -First 20) -join "`n")"
         }
+        if ($missing.Count -gt 0) {
+            $notFoundPath = Join-Path $script:ScriptRoot ("AutopilotNotFound_{0}.csv" -f (Get-Date).ToString('yyyy-MM-dd_HH-mm'))
+            try {
+                $missing | ForEach-Object { [PSCustomObject]@{ SerialNumber = $_ } } | Export-Csv -Path $notFoundPath -NoTypeInformation -Encoding UTF8
+                Write-UiLog "Not-found serials written to $notFoundPath"
+                $msg += "`n`nNot-found list saved to:`n$notFoundPath"
+            }
+            catch {
+                Write-UiLog "Could not write not-found CSV: $_"
+                $notFoundPath = $null
+            }
+        }
         Write-UiLog "CSV resolve done. Found $($found.Count), missing $($missing.Count)."
-        Update-StatusBar "CSV: $($found.Count) found. Set Group tag and Apply to selected."
-        [System.Windows.Forms.MessageBox]::Show($msg + "`n`nEnter Group tag and click Apply to selected.", 'CSV import', 'OK', 'Information') | Out-Null
+        Update-StatusBar "CSV: $($found.Count) found. Set Group tag and 'Apply to all imported', 'Remove tag from all imported', or select rows."
+        [System.Windows.Forms.MessageBox]::Show($msg + "`n`nEnter Group tag and click 'Apply to all imported ($($found.Count))' to tag, or 'Remove tag from all imported ($($found.Count))' to clear the tag. Or select rows and use 'Apply to selected'.", 'CSV import', 'OK', 'Information') | Out-Null
     }
     catch {
         Write-UiLog "CSV import failed: $_"
@@ -1162,7 +1431,7 @@ $script:btnImportCsv.Add_Click({
     }
 })
 
-$form.Add_FormClosing({
+$window.Add_Closing({
     if ($script:Connected) {
         try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
     }
@@ -1170,6 +1439,5 @@ $form.Add_FormClosing({
 
 #endregion
 
-Write-UiLog 'Ready (build 2026-03-18c, typed rows). Enter Client ID and Tenant ID, then press Connect.'
-[System.Windows.Forms.Application]::EnableVisualStyles()
-[void]$form.ShowDialog()
+Write-UiLog 'Ready (build 2026-09-30 WPF). Enter Client ID and Tenant ID, then press Connect.'
+[void]$window.ShowDialog()
