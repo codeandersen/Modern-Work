@@ -18,7 +18,7 @@ param(
     [string]$TenantId,
 
     [Parameter(Mandatory = $false)]
-    [switch]$UseDeviceCodeForIntune
+    [switch]$UseDeviceCode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -239,32 +239,15 @@ function Resolve-AutopilotMatch {
     return @{ Device = $null; Method = 'None' }
 }
 
-if ($UseDeviceCodeForIntune -and [string]::IsNullOrWhiteSpace($ClientId)) {
-    throw '-UseDeviceCodeForIntune requires -ClientId (device code is used only for the stage 2 Intune/Autopilot connection); aborting before authentication.'
-}
-
 Initialize-GraphModules
 
-$script:EntraScopes = @('GroupMember.Read.All', 'Device.Read.All')
-$script:IntuneScopes = @('DeviceManagementManagedDevices.Read.All', 'DeviceManagementServiceConfig.Read.All')
-
-$useTwoStageAuth = -not [string]::IsNullOrWhiteSpace($ClientId)
-$firstTenantId = $null
-
-if ($useTwoStageAuth) {
-    Write-Host 'Stage 1: connecting with the default Graph PowerShell client to read group membership...'
-    Connect-GraphSession -Scopes $script:EntraScopes -TenantId $TenantId
-    $ctx1 = Get-MgContext
-    if ($null -eq $ctx1 -or [string]::IsNullOrWhiteSpace($ctx1.TenantId)) {
-        throw 'Stage 1 connection returned no tenant context; aborting.'
-    }
-    $firstTenantId = [string]$ctx1.TenantId
-    if (-not [string]::IsNullOrWhiteSpace($TenantId) -and $firstTenantId -ine $TenantId) {
-        throw "Stage 1 connected tenant '$firstTenantId' does not match requested -TenantId '$TenantId'; aborting before group fetch."
-    }
+Connect-GraphSession -Scopes $script:GraphScopes -ClientId $ClientId -TenantId $TenantId -UseDeviceCode:$UseDeviceCode
+$ctx = Get-MgContext
+if ($null -eq $ctx -or [string]::IsNullOrWhiteSpace($ctx.TenantId)) {
+    throw 'Graph connection returned no tenant context; aborting.'
 }
-else {
-    Connect-GraphSession -Scopes $script:GraphScopes -TenantId $TenantId
+if (-not [string]::IsNullOrWhiteSpace($TenantId) -and $ctx.TenantId -ine $TenantId) {
+    throw "Connected tenant '$($ctx.TenantId)' does not match requested -TenantId '$TenantId'; aborting before group fetch."
 }
 
 Write-Host "Fetching group device members ($GroupId)..."
@@ -282,24 +265,6 @@ if ($entraDevices.Count -eq 0) {
     [System.IO.File]::WriteAllText($absOut, $header + "`r`n", [System.Text.UTF8Encoding]::new($false))
     Write-Host "No device members in group. Header-only CSV written to $OutputPath"
     return
-}
-
-if ($useTwoStageAuth) {
-    if ($UseDeviceCodeForIntune) {
-        Write-Host 'Stage 2: reconnecting with the supplied ClientId using device code. Device code instructions will appear in this console - follow them to sign in.'
-    }
-    else {
-        Write-Host 'Stage 2: reconnecting with the supplied ClientId to read Intune and Autopilot data...'
-    }
-    Disconnect-MgGraph | Out-Null
-    Connect-GraphSession -Scopes $script:IntuneScopes -ClientId $ClientId -TenantId $firstTenantId -UseDeviceCode:$UseDeviceCodeForIntune
-    $ctx2 = Get-MgContext
-    if ($null -eq $ctx2 -or [string]::IsNullOrWhiteSpace($ctx2.TenantId)) {
-        throw 'Stage 2 connection returned no tenant context; aborting export.'
-    }
-    if ($ctx2.TenantId -ine $firstTenantId) {
-        throw "Stage 2 tenant '$($ctx2.TenantId)' does not match stage 1 tenant '$firstTenantId'; aborting export."
-    }
 }
 
 Write-Host "Fetching Intune managed devices..."
